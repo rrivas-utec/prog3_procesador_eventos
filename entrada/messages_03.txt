@@ -1,0 +1,4 @@
+informacion|baja|soporte|Inicio del lote
+alerta|alta||Falta el destinatario
+alerta|alta|desconocido|Destinatario no configurado
+informacion|baja|docencia|Fin del lote

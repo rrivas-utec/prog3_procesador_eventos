@@ -1,0 +1,4 @@
+alerta|alta|docencia|Temperatura fuera de rango
+informacion|baja|soporte|Lectura recibida
+alerta|media|soporte|Servicio sin respuesta
+informacion|baja|docencia|Reporte disponible

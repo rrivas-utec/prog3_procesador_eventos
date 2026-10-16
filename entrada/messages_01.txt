@@ -1,0 +1,1 @@
+alerta|alta|docencia|Temperatura fuera de rango
