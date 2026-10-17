@@ -37,6 +37,8 @@ cmake --build build
 
 En Windows, el ejecutable suele estar en `build\\prog3_procesador_eventos.exe`; con un generador multiconfiguracion puede estar en `build\\Debug\\`. Si no se indica una carpeta, se usa `entrada` en modo sincrono.
 
+CMake copia entrada/, config/ y 	arget/ junto al ejecutable despues de compilar. En CLion, configura el *Working directory* de la Run Configuration como el directorio del ejecutable (por ejemplo, $PROJECT_DIR$/cmake-build-debug con el perfil actual). Asi las rutas relativas entrada y config/recipients.txt encuentran las copias del directorio de compilacion.
+
 La aplicacion recorre al iniciar la carpeta indicada y procesa sus archivos `.txt` en orden alfabetico. Cada linea no vacia usa el formato `tipo|severidad|destinatario|mensaje`. Los destinatarios se cargan desde `config/recipients.txt`. Las entregas se escriben en `salida/destinatarios/`, los fallos en `salida/dlq/` y el log central en `logs/events.log`.
 
 ## Estructura de codigo
