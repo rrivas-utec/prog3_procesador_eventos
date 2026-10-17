@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cstddef>
 
+// Contadores atomicos compartidos entre el hilo principal y los workers.
 struct statistics {
   std::atomic<std::size_t> lines{0};
   std::atomic<std::size_t> accepted{0};

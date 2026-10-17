@@ -10,8 +10,13 @@ find_package(Threads REQUIRED)
 add_executable(prog3_procesador_eventos
     src/main.cpp
     src/event.cpp
+    src/event_reader.cpp
+    src/event_creator_registry.cpp
     src/event_logger.cpp
     src/event_processor.cpp
+    src/execution_factory.cpp
+    src/sync_execution_factory.cpp
+    src/async_execution_factory.cpp
     src/recipient_config.cpp
     src/run_options.cpp
 )

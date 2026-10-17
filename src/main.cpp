@@ -9,18 +9,20 @@
 #include <string>
 
 int main(int argc, char* argv[]) {
+  // Lee los argumentos de ejecución y termina si son inválidos o se solicitó ayuda.
   run_options options;
-  int exit_code = 0;
-  if (!parse_options(argc, argv, options, exit_code)) return exit_code;
+  if (int exit_code = 0; !parse_options(argc, argv, options, exit_code)) return exit_code;
 
-  event_logger logger("logs/events.log");
+  // Prepara el registro, los contadores y las rutas de entrega configuradas.
+  event_logger& logger = event_logger::instance("logs/events.log");
   statistics stats;
   std::map<std::string, std::filesystem::path> recipients;
-  std::string config_error;
-  if (!load_recipients("config/recipients.txt", recipients, config_error)) {
+  if (std::string config_error; !load_recipients("config/recipients.txt", recipients, config_error)) {
+    // Informa el error de configuración tanto en el log como en la consola.
     logger.write("CONFIG_ERROR | " + config_error);
     std::cerr << "CONFIG_ERROR | " << config_error << '\n';
     return 1;
   }
-  return process_input(options, recipients, logger, stats);
+  // Procesa la entrada y devuelve el resultado como código de salida.
+  return process_input(options, recipients, stats);
 }

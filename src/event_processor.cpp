@@ -1,30 +1,27 @@
 #include "event_processor.h"
+#include "execution_factory.h"
+#include "event_logger.h"
+#include "event_reader.h"
+#include "event_creator_registry.h"
 
+#include <algorithm>
 #include <atomic>
-#include <condition_variable>
-#include <deque>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <mutex>
 #include <sstream>
-#include <thread>
 #include <vector>
 
 namespace {
 
-struct async_queue {
-  std::mutex mutex;
-  std::condition_variable ready;
-  std::deque<event> events;
-  bool closed{false};
-};
-
+// Serializa la salida por consola para evitar lineas intercaladas.
 void print_line(std::mutex& output_mutex, const std::string& line) {
-  std::lock_guard<std::mutex> lock(output_mutex);
+  std::lock_guard lock(output_mutex);
   std::cout << line << '\n';
 }
 
+// Construye el resumen final a partir de los contadores compartidos.
 std::string summary_text(const statistics& stats, const std::string& mode) {
   std::ostringstream summary;
   summary << "SUMMARY | mode=" << mode << " | lines=" << stats.lines.load()
@@ -35,6 +32,7 @@ std::string summary_text(const statistics& stats, const std::string& mode) {
   return summary.str();
 }
 
+// Busca un nombre de archivo que no exista en la carpeta indicada.
 std::filesystem::path unique_path(
     const std::filesystem::path& directory, const std::string& prefix,
     std::atomic<unsigned long long>& sequence) {
@@ -42,7 +40,7 @@ std::filesystem::path unique_path(
     const auto number = sequence.fetch_add(1) + 1;
     std::ostringstream file_name;
     file_name << prefix << std::setw(4) << std::setfill('0') << number << ".txt";
-    const std::filesystem::path candidate = directory / file_name.str();
+    std::filesystem::path candidate = directory / file_name.str();
     std::error_code error;
     const bool exists = std::filesystem::exists(candidate, error);
     if (error) return {};
@@ -50,10 +48,13 @@ std::filesystem::path unique_path(
   }
 }
 
+// Conserva un mensaje rechazado o fallido con su origen y motivo.
 bool save_dlq(const std::string& original, const std::filesystem::path& source_file,
-              std::size_t line_number, const std::string& reason, event_logger& logger,
-              statistics& stats, std::atomic<unsigned long long>& sequence,
+              const std::size_t line_number, const std::string& reason, statistics& stats,
+              std::atomic<unsigned long long>& sequence,
               std::filesystem::path& saved_path) {
+  event_logger& logger = event_logger::instance();
+  // Crea la DLQ si hace falta antes de reservar un nombre de archivo.
   const std::filesystem::path directory{"salida/dlq"};
   std::error_code error;
   std::filesystem::create_directories(directory, error);
@@ -77,6 +78,7 @@ bool save_dlq(const std::string& original, const std::filesystem::path& source_f
                  " | " + saved_path.string());
     return false;
   }
+  // Incluye el texto recibido y su procedencia para facilitar la revision posterior.
   output_file << "Contenido original: " << original << '\n'
               << "Archivo de entrada: " << source_file.string() << '\n'
               << "Línea: " << line_number << '\n' << "Motivo: " << reason << '\n';
@@ -91,19 +93,22 @@ bool save_dlq(const std::string& original, const std::filesystem::path& source_f
   return true;
 }
 
+// Entrega un evento validado; si falla, intenta conservarlo en la DLQ.
 void process_event(const event& current_event,
                    const std::map<std::string, std::filesystem::path>& recipients,
-                   event_logger& logger, statistics& stats,
+                   result_tracker& tracker, statistics& stats,
                    std::atomic<unsigned long long>& output_sequence,
                    std::atomic<unsigned long long>& dlq_sequence,
                    std::mutex& output_mutex) {
-  ++stats.processed;
+  event_logger& logger = event_logger::instance();
+  tracker.record_processed();
   const std::string action = current_event.type == "alerta"
       ? "alerta atendida" : "información registrada";
   logger.write("PROCESSED | " + current_event.id + " | result=ok | " + action);
   print_line(output_mutex, "PROCESSED | " + current_event.id + " | result=ok");
 
-  const std::filesystem::path destination = recipients.at(current_event.recipient);
+  // La ruta procede de la configuracion ya validada, no del texto de entrada.
+  const std::filesystem::path& destination = recipients.at(current_event.recipient);
   std::error_code error;
   std::filesystem::create_directories(destination, error);
   std::filesystem::path target;
@@ -111,8 +116,7 @@ void process_event(const event& current_event,
   if (!error) {
     target = unique_path(destination, "event_", output_sequence);
     if (!target.empty()) {
-      std::ofstream output_file(target, std::ios::binary);
-      if (output_file) {
+      if (std::ofstream output_file(target, std::ios::binary); output_file) {
         output_file << "id=" << current_event.id << '\n'
                     << "tipo=" << current_event.type << '\n'
                     << "severidad=" << current_event.severity << '\n'
@@ -132,6 +136,7 @@ void process_event(const event& current_event,
     return;
   }
 
+  // Si la entrega falla, conserva el evento en la DLQ con la causa disponible.
   const std::string reason = error ? "falló la carpeta de destino: " + error.message()
                                    : "no se pudo escribir el archivo de entrega";
   logger.write("DELIVERY_ERROR | " + current_event.id + " | " + reason);
@@ -139,123 +144,128 @@ void process_event(const event& current_event,
       current_event.recipient + "|" + current_event.message;
   std::filesystem::path dlq_path;
   const bool saved = save_dlq(original, current_event.source_file, current_event.line_number,
-                              reason, logger, stats, dlq_sequence, dlq_path);
+                              reason, stats, dlq_sequence, dlq_path);
   print_line(output_mutex, "DELIVERY_FAILED | " + current_event.id + " | " + reason + " | " +
                            (saved ? dlq_path.string() : "DLQ_ERROR"));
 }
 
-void process_synchronously(
-    const std::vector<event>& events,
-    const std::map<std::string, std::filesystem::path>& recipients,
-    event_logger& logger, statistics& stats,
-    std::atomic<unsigned long long>& output_sequence,
-    std::atomic<unsigned long long>& dlq_sequence, std::mutex& output_mutex) {
-  for (const event& current_event : events) {
-    process_event(current_event, recipients, logger, stats, output_sequence,
-                  dlq_sequence, output_mutex);
-  }
-}
-
-void process_asynchronously(
-    std::vector<event>& events,
-    const std::map<std::string, std::filesystem::path>& recipients,
-    const run_options& options, event_logger& logger, statistics& stats,
-    std::atomic<unsigned long long>& output_sequence,
-    std::atomic<unsigned long long>& dlq_sequence, std::mutex& output_mutex) {
-  async_queue queue;
-  std::vector<std::jthread> workers;
-  workers.reserve(options.worker_count);
-  for (std::size_t worker_index = 0; worker_index < options.worker_count; ++worker_index) {
-    workers.emplace_back([&queue, &recipients, &logger, &stats, &output_sequence,
-                          &dlq_sequence, &output_mutex]() {
-      while (true) {
-        event current_event;
-        {
-          std::unique_lock<std::mutex> lock(queue.mutex);
-          queue.ready.wait(lock, [&queue]() { return queue.closed || !queue.events.empty(); });
-          if (queue.events.empty() && queue.closed) return;
-          current_event = std::move(queue.events.front());
-          queue.events.pop_front();
-        }
-        process_event(current_event, recipients, logger, stats, output_sequence,
-                      dlq_sequence, output_mutex);
-      }
-    });
-  }
-  {
-    std::lock_guard<std::mutex> lock(queue.mutex);
-    for (event& current_event : events) queue.events.push_back(std::move(current_event));
-    queue.closed = true;
-  }
-  queue.ready.notify_all();
-  workers.clear();
-}
-
 }  // namespace
 
+// Recorre los TXT de la carpeta, valida sus lineas y procesa los eventos.
 int process_input(const run_options& options,
                   const std::map<std::string, std::filesystem::path>& recipients,
-                  event_logger& logger, statistics& stats) {
+                  statistics& stats) {
+  event_logger& logger = event_logger::instance();
   std::mutex output_mutex;
-  std::ifstream input_file(options.input_file);
-  if (!input_file) {
+  const auto factory = make_execution_factory(options.mode);
+  auto tracker = factory->create_result_tracker(stats);
+  std::error_code error;
+  // Un directorio invalido se informa como error de entrada antes de recorrerlo.
+  if (!std::filesystem::is_directory(options.input_directory, error) || error) {
     ++stats.input_errors;
-    logger.write("INPUT_ERROR | " + options.input_file.string() + " | no existe o no se puede abrir");
-    print_line(output_mutex, "INPUT_ERROR | " + options.input_file.string() +
-                             " | no existe o no se puede abrir");
-    print_line(output_mutex, summary_text(stats, options.mode));
+    const std::string message = "INPUT_ERROR | " + options.input_directory.string() +
+                                " | la carpeta no existe o no se puede leer";
+    logger.write(message);
+    print_line(output_mutex, message);
+    const std::string summary = summary_text(stats, options.mode);
+    print_line(output_mutex, summary);
+    logger.write(summary);
     return 1;
   }
 
+  // Reune los TXT y los ordena para obtener un recorrido reproducible.
+  std::vector<std::filesystem::path> input_files;
+  std::filesystem::directory_iterator iterator(options.input_directory, error);
+  const std::filesystem::directory_iterator end;
+  if (error) {
+    ++stats.input_errors;
+    const std::string message = "INPUT_ERROR | " + options.input_directory.string() +
+                                " | no se pudo recorrer la carpeta: " + error.message();
+    logger.write(message);
+    print_line(output_mutex, message);
+  } else {
+    while (iterator != end) {
+      std::error_code entry_error;
+      // Ignora subcarpetas y procesa solo archivos TXT del directorio indicado.
+      if (iterator->is_regular_file(entry_error) && !entry_error &&
+          iterator->path().extension() == ".txt") {
+        input_files.push_back(iterator->path());
+      }
+      iterator.increment(error);
+      if (error) {
+        ++stats.input_errors;
+        const std::string message = "INPUT_ERROR | " + options.input_directory.string() +
+                                    " | error recorriendo la carpeta: " + error.message();
+        logger.write(message);
+        print_line(output_mutex, message);
+        break;
+      }
+    }
+  }
+  std::sort(input_files.begin(), input_files.end());
+
+  // Secuencias compartidas para asignar identificadores y nombres unicos.
   std::atomic<unsigned long long> event_sequence{0};
   std::atomic<unsigned long long> output_sequence{0};
   std::atomic<unsigned long long> dlq_sequence{0};
   std::vector<event> accepted_events;
-  std::string line;
-  std::size_t line_number = 0;
-  while (std::getline(input_file, line)) {
-    ++line_number;
-    if (trim(line).empty()) continue;
-    ++stats.lines;
-    std::string reason;
-    auto parsed_event = parse_event(line, options.input_file, line_number, recipients, reason);
-    if (!parsed_event) {
-      ++stats.rejected;
-      std::filesystem::path saved_path;
-      const bool stored = save_dlq(line, options.input_file, line_number, reason,
-                                   logger, stats, dlq_sequence, saved_path);
-      const std::string result = "REJECTED | " + options.input_file.string() + ":" +
-          std::to_string(line_number) + " | " + reason + " | " +
-          (stored ? saved_path.string() : "DLQ_ERROR");
+  // Usa el registro Singleton que contiene los creadores TXT y CSV.
+  event_creator_registry& creator_registry = event_creator_registry::instance();
+  // TXT es el formato predeterminado; basta cambiar esta clave para usar CSV.
+  constexpr const char* input_format = "txt";
+  std::unique_ptr<event_file_creator> creator =
+      creator_registry.create_creator(input_format);
+  for (const auto& source_file : input_files) {
+    const event_import_result imported_file = creator->import_file(source_file, recipients);
+    if (!imported_file.error.empty()) {
+      ++stats.input_errors;
+      const std::string message = "INPUT_ERROR | " + source_file.string() +
+                                  " | " + imported_file.error;
+      logger.write(message);
+      print_line(output_mutex, message);
+    }
+
+    // El creador entrega cada linea no vacia junto con su parseo o motivo de rechazo.
+    for (const auto& imported : imported_file.records) {
+      ++stats.lines;
+      if (!imported.parsed_event) {
+        ++stats.rejected;
+        std::filesystem::path saved_path;
+        const bool stored = save_dlq(imported.original_line, source_file,
+                                     imported.line_number, imported.reason,
+                                     stats, dlq_sequence, saved_path);
+        const std::string result = "REJECTED | " + source_file.string() + ":" +
+            std::to_string(imported.line_number) + " | " + imported.reason + " | " +
+            (stored ? saved_path.string() : "DLQ_ERROR");
+        logger.write(result);
+        print_line(output_mutex, result);
+        continue;
+      }
+
+      event parsed_event = *imported.parsed_event;
+      std::ostringstream event_id;
+      event_id << "event_" << std::setw(4) << std::setfill('0')
+               << event_sequence.fetch_add(1) + 1;
+      parsed_event.id = event_id.str();
+      ++stats.accepted;
+      const std::string result = "ACCEPTED | " + source_file.string() + ":" +
+          std::to_string(imported.line_number) + " | " + parsed_event.id + " | " +
+          parsed_event.type + " | " + parsed_event.severity + " | " +
+          parsed_event.recipient;
       logger.write(result);
       print_line(output_mutex, result);
-      continue;
+      accepted_events.push_back(std::move(parsed_event));
     }
-    std::ostringstream event_id;
-    event_id << "event_" << std::setw(4) << std::setfill('0') << event_sequence.fetch_add(1) + 1;
-    parsed_event->id = event_id.str();
-    ++stats.accepted;
-    const std::string result = "ACCEPTED | " + options.input_file.string() + ":" +
-        std::to_string(line_number) + " | " + parsed_event->id + " | " + parsed_event->type +
-        " | " + parsed_event->severity + " | " + parsed_event->recipient;
-    logger.write(result);
-    print_line(output_mutex, result);
-    accepted_events.push_back(std::move(*parsed_event));
-  }
-  if (input_file.bad()) {
-    ++stats.input_errors;
-    logger.write("INPUT_ERROR | " + options.input_file.string() + " | error durante la lectura");
-    print_line(output_mutex, "INPUT_ERROR | " + options.input_file.string() +
-                             " | error durante la lectura");
-  }
+  }  // La Abstract Factory crea productos compatibles con el modo de ejecucion.
+  auto dispatcher = factory->create_dispatcher(options.worker_count);
+  auto shutdown = factory->create_shutdown_coordinator(*dispatcher);
+  const auto handler = [&](const event& current_event) {
+    process_event(current_event, recipients, *tracker, stats, output_sequence,
+                  dlq_sequence, output_mutex);
+  };
+  dispatcher->dispatch(accepted_events, handler);
+  shutdown->finish();
 
-  if (options.mode == "sync") {
-    process_synchronously(accepted_events, recipients, logger, stats, output_sequence,
-                          dlq_sequence, output_mutex);
-  } else {
-    process_asynchronously(accepted_events, recipients, options, logger, stats,
-                           output_sequence, dlq_sequence, output_mutex);
-  }
   const std::string summary = summary_text(stats, options.mode);
   print_line(output_mutex, summary);
   logger.write(summary);
